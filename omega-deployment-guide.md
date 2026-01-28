@@ -66,9 +66,11 @@ Omega automatically provisions Athenz certificates and mounts them at:
 - `/var/run/athenz/service.cert.pem`
 - `/var/run/athenz/service.key.pem`
 
-The service identity is constructed as: `{athensDomain}.{appName}`
-- Nonprod: `sre.kafka-consumer-nonprod-k8s.kafka-consumer`
-- Prod: `sre.kafka-consumer-k8s.kafka-consumer`
+The service identity is constructed as: `{athensDomain}.{appName}-{environment}`
+- Nonprod: `sre.kafka-consumer-nonprod-k8s.kafka-consumer-development`
+- Prod: `sre.kafka-consumer-k8s.kafka-consumer-production`
+
+**Important**: The Athenz services must be created in terraform with the environment suffix (see Pre-Deployment Checklist).
 
 ### Resource Allocation
 
@@ -339,11 +341,89 @@ kubectl --context omega-aws.centraltech-nonprod1.use1 \
 
 ## Deployment Workflow
 
-### First-Time Setup
+### Pre-Deployment Checklist
 
-1. **Create PVCs** in both nonprod and prod clusters (see above)
-2. **Verify Athenz/IAM** setup via Terraform (`sre-terraform-kafka-consumer-eks`)
-3. **Merge to main** to trigger the pipeline
+Before your first deployment, complete these steps:
+
+| # | Task | Command/Action | Status |
+|---|------|----------------|--------|
+| 1 | **Update Athenz services in terraform** | Add environment suffix to service names | |
+| 2 | **Apply terraform changes** | `terraform apply` in both domains | |
+| 3 | **Create PVCs** | `kubectl apply -f pvc-*.yaml` | |
+| 4 | **Grant CKMS access** | Add services to `sre:group.sre-team` | |
+| 5 | **Commit and push changes** | Create PR to trigger pipeline | |
+
+#### Step 1: Update Terraform Services
+
+The Athenz services must include the environment suffix to match what Omega expects.
+
+**Nonprod** (`sre-terraform-kafka-consumer-eks/terraform/athenz/sre.kafka-consumer-nonprod-k8s/services.tf`):
+```hcl
+locals {
+  omega_athenz_services = [
+    "kafka-consumer-development",
+  ]
+}
+```
+
+**Prod** (`sre-terraform-kafka-consumer-eks/terraform/athenz/sre.kafka-consumer-k8s/services.tf`):
+```hcl
+locals {
+  omega_athenz_services = [
+    "kafka-consumer-production",
+  ]
+}
+```
+
+#### Step 2: Apply Terraform
+
+```bash
+cd /path/to/sre-terraform-kafka-consumer-eks/terraform/athenz/sre.kafka-consumer-nonprod-k8s
+terraform apply
+
+cd /path/to/sre-terraform-kafka-consumer-eks/terraform/athenz/sre.kafka-consumer-k8s
+terraform apply
+```
+
+#### Step 3: Create PVCs
+
+PVC manifests are in `deploy_target/omega/`. Use `--role k8s_nsadmin` for permissions.
+
+```bash
+# Nonprod
+kubectl-ctx omega-aws.centraltech-nonprod1.use1 \
+  --namespace sre-kafka--consumer--nonprod--k8s --role k8s_nsadmin
+kubectl apply -f deploy_target/omega/pvc-nonprod.yaml
+
+# Prod
+kubectl-ctx omega-aws.centraltech-prod1.use1 \
+  --namespace sre-kafka--consumer--k8s --role k8s_nsadmin
+kubectl apply -f deploy_target/omega/pvc-prod.yaml
+```
+
+#### Step 4: Grant CKMS Access
+
+Add the service identities to the group that has CKMS access (`sre:group.sre-team`):
+
+```
+sre.kafka-consumer-nonprod-k8s.kafka-consumer-development
+sre.kafka-consumer-k8s.kafka-consumer-production
+```
+
+### First Deployment
+
+1. **Commit changes** to a branch
+2. **Push and create PR** - triggers the pipeline
+3. **Monitor Screwdriver** - watch `validation → python_package → docker → component`
+4. **Check pod status** after `component` job completes:
+
+```bash
+kubectl-ctx omega-aws.centraltech-nonprod1.use1 \
+  --namespace sre-kafka--consumer--nonprod--k8s --role k8s_nsadmin
+
+kubectl get pods
+kubectl logs <pod-name> -c app -f
+```
 
 ### Regular Deployments
 
@@ -355,7 +435,7 @@ kubectl --context omega-aws.centraltech-nonprod1.use1 \
 ### Manual Trigger for Production
 
 Production deployment requires manual approval. In Screwdriver UI:
-1. Navigate to the pipeline
+1. Navigate to the pipeline (ID: 1132405)
 2. Click on `deploy-production` job
 3. Click "Start" to trigger deployment
 
@@ -363,33 +443,57 @@ Production deployment requires manual approval. In Screwdriver UI:
 
 ## Troubleshooting
 
+**Note**: Use `kubectl-ctx` with `--role k8s_nsadmin` to get proper permissions.
+
+### Set Up kubectl Context
+
+```bash
+# Nonprod
+kubectl-ctx omega-aws.centraltech-nonprod1.use1 \
+  --namespace sre-kafka--consumer--nonprod--k8s --role k8s_nsadmin
+
+# Prod
+kubectl-ctx omega-aws.centraltech-prod1.use1 \
+  --namespace sre-kafka--consumer--k8s --role k8s_nsadmin
+```
+
 ### Check Pod Status
 ```bash
-kubectl --context omega-aws.centraltech-nonprod1.use1 \
-  -n sre.kafka-consumer-nonprod-k8s \
-  get pods
+kubectl get pods
+kubectl describe pod <pod-name>
 ```
 
 ### View Pod Logs
 ```bash
-kubectl --context omega-aws.centraltech-nonprod1.use1 \
-  -n sre.kafka-consumer-nonprod-k8s \
-  logs <pod-name> -c app
+# App container logs
+kubectl logs <pod-name> -c app
+
+# Follow logs in real-time
+kubectl logs <pod-name> -c app -f
+
+# Splunk sidecar logs
+kubectl logs <pod-name> -c splunk
 ```
 
 ### Check Athenz Certificates
 ```bash
-kubectl --context omega-aws.centraltech-nonprod1.use1 \
-  -n sre.kafka-consumer-nonprod-k8s \
-  exec <pod-name> -c app -- ls -la /var/run/athenz/
+kubectl exec <pod-name> -c app -- ls -la /var/run/athenz/
 ```
 
 ### View PVC Status
 ```bash
-kubectl --context omega-aws.centraltech-nonprod1.use1 \
-  -n sre.kafka-consumer-nonprod-k8s \
-  describe pvc kafka-consumer-history-dev
+kubectl get pvc
+kubectl describe pvc kafka-consumer-history-dev
 ```
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pod stuck in `Pending` | PVC not created or not bound | Check PVC status, verify storage class |
+| `CrashLoopBackOff` | App startup failure | Check app logs, verify config file exists |
+| CKMS access denied | Service not in access group | Add service identity to `sre:group.sre-team` |
+| Athenz cert not found | Identity provisioning delay | Wait up to 20 min, check `progressDeadlineSeconds` |
 
 ---
 
@@ -424,23 +528,22 @@ sre.tooling:role.paranoids.ppse.ckms.ykeykey_aws.res_group.bigpanda.keys.sre.acc
 
 ### Granting Access to New Services
 
-The admin of `sre.tooling` domain must add the service identities to the CKMS access role:
+Our team has access to CKMS keys via the `sre:group.sre-team` group. Add the service identities to this group:
 
+**Service identities to add:**
+```
+sre.kafka-consumer-nonprod-k8s.kafka-consumer-development
+sre.kafka-consumer-k8s.kafka-consumer-production
+```
+
+You can manage group membership via the Athenz UI or CLI:
 ```bash
-# For NONPROD
-zms-cli -d sre.tooling add-role-member \
-  paranoids.ppse.ckms.ykeykey_aws.res_group.bigpanda.keys.sre.access \
-  sre.kafka-consumer-nonprod-k8s.kafka-consumer
-
-# For PROD
-zms-cli -d sre.tooling add-role-member \
-  paranoids.ppse.ckms.ykeykey_aws.res_group.bigpanda.keys.sre.access \
-  sre.kafka-consumer-k8s.kafka-consumer
+zms-cli -d sre show-group sre-team
 ```
 
 ### Verifying Access
 
-To check if a service has access:
+To check if a service has access to the CKMS keys:
 ```bash
 zms-cli -d sre.tooling show-role \
   paranoids.ppse.ckms.ykeykey_aws.res_group.bigpanda.keys.sre.access
